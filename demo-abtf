@@ -1,0 +1,46 @@
+# AutoSoft research prototype: detecting a silent GPU error with a checksum (ABFT-style)
+import torch, struct
+
+assert torch.cuda.is_available(), "Switch Colab runtime to GPU"
+dev = "cuda"
+torch.manual_seed(0)
+n = 2048
+A = torch.randn(n, n, device=dev, dtype=torch.float32)
+B = torch.randn(n, n, device=dev, dtype=torch.float32)
+
+def checksum_check(A, B, C, tol=1e-2):
+    """Cheap check: column sums of A @ B must equal (column sums of A) @ B.
+    Costs O(n^2) instead of recomputing the full O(n^3) multiply."""
+    expected = A.sum(dim=0) @ B          # what the column sums of C should be
+    actual = C.sum(dim=0)
+    rel_err = ((expected - actual).abs() / (expected.abs() + 1e-6))
+    bad_cols = (rel_err > tol).nonzero().flatten()
+    return bad_cols
+
+def flip_bit(x, bit):
+    """Flip one bit of a float32 value, like a faulty transistor would."""
+    i = struct.unpack("I", struct.pack("f", x))[0] ^ (1 << bit)
+    return struct.unpack("f", struct.pack("I", i))[0]
+
+print(f"GPU: {torch.cuda.get_device_name(0)}\n")
+
+# 1) Clean run
+C = A @ B
+print("Clean multiply   -> corrupted columns detected:", checksum_check(A, B, C).tolist())
+
+# 2) Simulate a silent hardware fault: flip one exponent bit in one output value
+r, c = 1234, 567
+orig = C[r, c].item()
+C[r, c] = flip_bit(orig, 27)
+print(f"Injected fault   -> C[{r},{c}] changed {orig:.4f} -> {C[r, c].item():.4f} (no crash, no error)")
+print("Faulty multiply  -> corrupted columns detected:", checksum_check(A, B, C).tolist())
+
+# 3) Overhead of the check vs the multiply itself
+import time
+torch.cuda.synchronize(); t = time.time()
+for _ in range(20): C = A @ B
+torch.cuda.synchronize(); t_mm = (time.time() - t) / 20
+t = time.time()
+for _ in range(20): checksum_check(A, B, C)
+torch.cuda.synchronize(); t_ck = (time.time() - t) / 20
+print(f"\nMultiply: {t_mm*1e3:.2f} ms | Check: {t_ck*1e3:.2f} ms | Overhead: {100*t_ck/t_mm:.1f}%")
